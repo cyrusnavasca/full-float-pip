@@ -351,8 +351,8 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
         self.volumeSlider = slider
         x += 64
 
-        // Time label (right-aligned)
-        let tLabel = NSTextField(frame: NSRect(x: width - 100, y: 8, width: 92, height: 20))
+        // Time label (right-aligned, left of the track menu button)
+        let tLabel = NSTextField(frame: NSRect(x: width - 136, y: 8, width: 92, height: 20))
         tLabel.stringValue = "0:00 / 0:00"
         tLabel.isEditable = false
         tLabel.isBordered = false
@@ -364,6 +364,13 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
         tLabel.autoresizingMask = [.minXMargin]
         self.timeLabel = tLabel
         controlBarView.addSubview(tLabel)
+
+        // Audio track & subtitles menu (far right, clear of the resize border)
+        let tracksBtn = makeControlButton(x: width - 44, symbolName: "gearshape.fill",
+                                          action: #selector(showTrackMenu(_:)))
+        tracksBtn.autoresizingMask = [.minXMargin]
+        tracksBtn.toolTip = "Audio track & subtitles"
+        controlBarView.addSubview(tracksBtn)
 
         container.addSubview(controlBarView)
 
@@ -463,9 +470,10 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
         installPlayerPrefsSeedScript()
 
         if site == "youtube" {
-            // One-line capture summary so caption problems are attributable at
-            // a glance: was the track (incl. translation) captured at all?
-            var trackDesc = "none"
+            // One-line capture summary so caption/audio problems are attributable
+            // at a glance: was the track (incl. translation) captured at all?
+            // "off" = tab had CC off; "none" = nothing captured.
+            var trackDesc = (playerPrefs?["captionsOff"] as? Bool == true) ? "off" : "none"
             if let track = playerPrefs?["captionTrack"] as? [String: Any],
                let lang = track["languageCode"] as? String {
                 if let tl = track["translationLanguage"] as? [String: Any],
@@ -475,9 +483,10 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
                     trackDesc = lang
                 }
             }
+            let audioDesc = (playerPrefs?["audioTrack"] as? [String: Any])?["id"] as? String ?? "default"
             let lsCount = (playerPrefs?["localStorage"] as? [String: Any])?.count ?? 0
             let rate = (playerPrefs?["playbackRate"] as? NSNumber)?.doubleValue ?? 1.0
-            NSLog("[FloatVideo] playerPrefs received: track=\(trackDesc) lsKeys=\(lsCount) rate=\(rate)")
+            NSLog("[FloatVideo] playerPrefs received: track=\(trackDesc) audio=\(audioDesc) lsKeys=\(lsCount) rate=\(rate)")
         }
 
         // Suspend all media playback while overlay is visible, prevent audio during loading
@@ -683,10 +692,13 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
     }
 
     /// Re-applies the exact per-video player state captured from the Chrome tab
-    /// at float time: the active caption track (including auto-translate target
-    /// language) and the playback rate. Retries until YouTube's player + caption
-    /// module are ready; the localStorage seed above already covers the sticky
-    /// defaults, this covers the current video's explicit selection.
+    /// at float time: the audio track (dubbed videos), the caption track
+    /// (including auto-translate target language) or captions explicitly off,
+    /// and the playback rate. Retries until YouTube's player + caption module
+    /// are ready; the localStorage seed above already covers the sticky
+    /// defaults, this covers the current video's explicit selection. Without it
+    /// the WKWebView session (different language than Chrome) gets YouTube's
+    /// own picks — e.g. an auto-dubbed track and auto-enabled captions.
     private func scheduleApplyPlayerPrefs() {
         guard currentSite == "youtube", loadingStrategy == .fullPageInject,
               playerPrefs != nil else { return }
@@ -705,55 +717,25 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
             return
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self = self else { return }
-            var trackB64 = ""
-            if let track = self.playerPrefs?["captionTrack"] as? [String: Any],
-               let data = try? JSONSerialization.data(withJSONObject: track) {
-                trackB64 = data.base64EncodedString()
+            guard let self = self, let prefs = self.playerPrefs else { return }
+            var sync: [String: Any] = [
+                "rate": (prefs["playbackRate"] as? NSNumber)?.doubleValue ?? 1.0
+            ]
+            if let track = prefs["captionTrack"] as? [String: Any] {
+                sync["captionTrack"] = track
+            } else if prefs["captionsOff"] as? Bool == true {
+                sync["captionsOff"] = true
             }
-            let rate = (self.playerPrefs?["playbackRate"] as? NSNumber)?.doubleValue ?? 1.0
-            let js = """
-            (function() {
-                if (window.__floatVideoPrefsApplied) return 'done';
-                var p = document.getElementById('movie_player') || document.querySelector('.html5-video-player');
-                if (!p) return 'retry';
-                // While an ad plays, the player exposes the ad's (empty)
-                // tracklist — applying now would misfire. Report distinctly so
-                // the native side keeps waiting without burning the deadline.
-                if (p.classList.contains('ad-showing') || p.classList.contains('ad-interrupting')) {
-                    return 'ad';
-                }
-                var rate = \(rate);
-                if (rate > 0 && rate !== 1 && typeof p.setPlaybackRate === 'function') {
-                    try { p.setPlaybackRate(rate); } catch (e) {}
-                }
-                var trackB64 = '\(trackB64)';
-                if (!trackB64) { window.__floatVideoPrefsApplied = true; return 'applied'; }
-                if (typeof p.setOption !== 'function' || typeof p.getOption !== 'function') return 'retry';
-                // The captions module may be unloaded when CC starts off.
-                try { if (typeof p.loadModule === 'function') p.loadModule('captions'); } catch (e) {}
-                var list = null;
-                try { list = p.getOption('captions', 'tracklist'); } catch (e) { return 'retry'; }
-                if (!list || !list.length) return 'retry';
-                try {
-                    var track = JSON.parse(atob(trackB64));
-                    p.setOption('captions', 'track', track);
-                    // Verify it took — setOption silently no-ops while the
-                    // module is mid-initialization.
-                    var cur = p.getOption('captions', 'track');
-                    if (!cur || !cur.languageCode) return 'retry';
-                    window.__floatVideoPrefsApplied = true;
-                    return 'applied';
-                } catch (e) { return 'retry'; }
-            })();
-            """
-            self.webView.evaluateJavaScript(js) { [weak self] result, _ in
+            if let audioId = (prefs["audioTrack"] as? [String: Any])?["id"] as? String {
+                sync["audioId"] = audioId
+            }
+            self.runMediaTracksJS(["action": "sync", "prefs": sync]) { [weak self] result in
                 guard let self = self else { return }
                 let status = result as? String ?? "retry"
                 self.lastPrefsStatus = status
                 switch status {
                 case "applied":
-                    NSLog("[FloatVideo] Player prefs applied (captions/rate)")
+                    NSLog("[FloatVideo] Player prefs applied (audio/captions/rate)")
                     self.prefsApplyDeadline = nil
                 case "ad":
                     // Ad occupying the player: extend patience past the ad
@@ -1713,6 +1695,468 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
         }
         """
         webView.evaluateJavaScript(js, completionHandler: nil)
+    }
+
+    // MARK: - Audio Track & Subtitle Menu
+
+    /// In-page helper behind the track menu and the float-time prefs sync.
+    /// Called as `(source)(request)`; re-evaluated on every use because a full
+    /// in-page navigation wipes the JS world. Actions:
+    /// - `query`: lists audio tracks, caption tracks and auto-translate
+    ///   languages with the current selection.
+    /// - `select`: applies a menu pick ({type: audio|captions|translate, id}).
+    /// - `sync`: applies the Chrome tab's captured state; returns the status
+    ///   protocol of `attemptApplyPlayerPrefs` (done/retry/ad/applied).
+    /// YouTube goes through the #movie_player API; other sites fall back to the
+    /// main <video>'s HTML5 audioTracks/textTracks.
+    private static let mediaTracksJS = """
+    (function(req) {
+        var p = document.getElementById('movie_player') || document.querySelector('.html5-video-player');
+        var yt = !!(p && typeof p.getAvailableAudioTracks === 'function' && typeof p.getOption === 'function');
+        var video = window.__floatVideoMainVideo || document.querySelector('video');
+
+        function inAd() {
+            return !!(p && p.classList && (p.classList.contains('ad-showing') || p.classList.contains('ad-interrupting')));
+        }
+
+        // ---- YouTube audio tracks (dubbed videos) ----
+        function audioInfo(t) {
+            try { return (t && typeof t.getLanguageInfo === 'function') ? t.getLanguageInfo() : null; } catch (e) { return null; }
+        }
+        function audioTracks() {
+            try { return p.getAvailableAudioTracks() || []; } catch (e) { return []; }
+        }
+        function currentAudioId() {
+            var li = null;
+            try { li = audioInfo(p.getAudioTrack()); } catch (e) {}
+            return (li && li.id) || '';
+        }
+        function findAudio(id, sameLanguageOk) {
+            var tracks = audioTracks(), i, li;
+            for (i = 0; i < tracks.length; i++) {
+                li = audioInfo(tracks[i]);
+                if (li && li.id === id) return tracks[i];
+            }
+            if (!sameLanguageOk) return null;
+            // Ids are "<lang>.<variant>" (e.g. zh-Hant.4 original, en-US.10
+            // auto-dubbed); fall back to the same language.
+            var lang = String(id).split('.')[0];
+            for (i = 0; i < tracks.length; i++) {
+                li = audioInfo(tracks[i]);
+                if (li && String(li.id).split('.')[0] === lang) return tracks[i];
+            }
+            return null;
+        }
+
+        // ---- YouTube captions ----
+        function captionKey(c) {
+            return c.vss_id || c.vssId || ((c.languageCode || '') + '|' + (c.kind || ''));
+        }
+        function captionList() {
+            var list = null;
+            // includeAsr: without it auto-generated tracks are left out and
+            // ASR-only videos look like they have no captions at all.
+            try { list = p.getOption('captions', 'tracklist', { includeAsr: true }); } catch (e) {}
+            if (list && list.length) return list;
+            // Captions module not loaded (CC off since page load): the active
+            // audio track carries the same list.
+            try {
+                var at = p.getAudioTrack();
+                return ((at && at.captionTracks) || []).map(function(c) {
+                    return { languageCode: c.languageCode, languageName: c.languageName,
+                             displayName: c.displayName, kind: c.kind, vss_id: c.vssId,
+                             is_translateable: c.isTranslateable };
+                });
+            } catch (e) { return []; }
+        }
+        function currentCaption() {
+            try {
+                var t = p.getOption('captions', 'track');
+                return (t && t.languageCode) ? t : null;
+            } catch (e) { return null; }
+        }
+        function translationLanguages() {
+            var list = null;
+            try { list = p.getOption('captions', 'translationLanguages'); } catch (e) {}
+            if (list && list.length) return list;
+            try {
+                var r = p.getPlayerResponse().captions.playerCaptionsTracklistRenderer;
+                return (r.translationLanguages || []).map(function(l) {
+                    var n = l.languageName || {};
+                    return { languageCode: l.languageCode,
+                             languageName: n.simpleText || (n.runs || []).map(function(x) { return x.text; }).join('') };
+                });
+            } catch (e) { return []; }
+        }
+        function findCaption(list, want) {
+            var i, key = captionKey(want);
+            for (i = 0; i < list.length; i++) if (captionKey(list[i]) === key) return list[i];
+            for (i = 0; i < list.length; i++) {
+                if (list[i].languageCode === want.languageCode && (list[i].kind || '') === (want.kind || '')) return list[i];
+            }
+            for (i = 0; i < list.length; i++) if (list[i].languageCode === want.languageCode) return list[i];
+            return null;
+        }
+        function isTranslatable(c) { return !!(c.is_translateable || c.isTranslateable); }
+        function translationCode(t) {
+            return (t && t.translationLanguage && t.translationLanguage.languageCode) || '';
+        }
+        function captionMatches(want) {
+            var cur = currentCaption();
+            if (!want) return !cur;
+            return !!cur && cur.languageCode === want.languageCode && translationCode(cur) === translationCode(want);
+        }
+        // want: null turns CC off; otherwise a track (from the list, or a
+        // captured {languageCode, kind, vssId}) plus optional translationLanguage.
+        function setCaption(want) {
+            if (!want) { p.setOption('captions', 'track', {}); return; }
+            // The captions module may be unloaded when CC starts off.
+            try { if (typeof p.loadModule === 'function') p.loadModule('captions'); } catch (e) {}
+            var base = findCaption(captionList(), want), track = {}, k;
+            if (base) {
+                for (k in base) if (k !== 'translationLanguage') track[k] = base[k];
+            } else {
+                track.languageCode = want.languageCode;
+                if (want.kind) track.kind = want.kind;
+            }
+            var tl = translationCode(want);
+            if (tl) {
+                var langs = translationLanguages(), name = '';
+                for (var i = 0; i < langs.length; i++) if (langs[i].languageCode === tl) name = langs[i].languageName;
+                track.translationLanguage = name ? { languageCode: tl, languageName: name } : { languageCode: tl };
+            }
+            p.setOption('captions', 'track', track);
+        }
+        // Re-checks a pick a few times: setOption silently no-ops while the
+        // captions module is mid-initialization, and an audio switch can make
+        // YouTube re-pick captions from the new track's defaults.
+        function settle(check, apply) {
+            [700, 2000, 4500].forEach(function(ms) {
+                setTimeout(function() {
+                    if (inAd() || check()) return;
+                    try { apply(); } catch (e) {}
+                }, ms);
+            });
+        }
+
+        if (req.action === 'query') {
+            if (p) {
+                if (!yt) return { source: 'youtube', loading: true };
+                if (inAd()) return { source: 'youtube', ad: true };
+                var curAudio = currentAudioId();
+                var audio = audioTracks().map(function(t) {
+                    var li = audioInfo(t) || {};
+                    return { id: String(li.id || ''), label: String(li.name || li.id || ''),
+                             autoDubbed: !!li.isAutoDubbed, selected: !!li.id && li.id === curAudio };
+                }).filter(function(a) { return a.id; });
+                var cur = currentCaption(), list = captionList();
+                var selected = cur ? findCaption(list, cur) : null;
+                var captions = list.map(function(c) {
+                    return { id: captionKey(c), label: String(c.displayName || c.languageName || c.languageCode || ''),
+                             selected: c === selected };
+                });
+                return {
+                    source: 'youtube', audio: audio, captions: captions, captionsOn: !!cur,
+                    translation: translationCode(cur),
+                    translationLanguages: list.some(isTranslatable) ? translationLanguages().map(function(l) {
+                        return { id: l.languageCode, label: l.languageName || l.languageCode };
+                    }) : []
+                };
+            }
+            if (video) {
+                var out = { source: 'html5', audio: [], captions: [], captionsOn: false };
+                var ats = video.audioTracks, tts = video.textTracks, n, t;
+                for (n = 0; ats && n < ats.length; n++) {
+                    t = ats[n];
+                    out.audio.push({ id: String(n), label: t.label || t.language || ('Track ' + (n + 1)), selected: !!t.enabled });
+                }
+                for (n = 0; tts && n < tts.length; n++) {
+                    t = tts[n];
+                    if (t.kind !== 'subtitles' && t.kind !== 'captions') continue;
+                    out.captions.push({ id: String(n), label: t.label || t.language || ('Track ' + (n + 1)), selected: t.mode === 'showing' });
+                    if (t.mode === 'showing') out.captionsOn = true;
+                }
+                if (out.audio.length <= 1 && !out.captions.length) out.source = 'none';
+                return out;
+            }
+            return { source: 'none' };
+        }
+
+        if (req.action === 'select') {
+            if (yt) {
+                if (inAd()) return 'ad';
+                // A manual pick ends the float-time sync from the Chrome tab.
+                window.__floatVideoPrefsApplied = true;
+                if (req.type === 'audio') {
+                    var target = findAudio(req.id, false);
+                    if (!target) return 'missing';
+                    var keep = currentCaption();
+                    try { p.setAudioTrack(target); } catch (e) { return 'error'; }
+                    settle(function() { return captionMatches(keep); }, function() { setCaption(keep); });
+                    return 'ok';
+                }
+                var want = null, tracks = captionList(), j;
+                if (req.type === 'captions' && req.id) {
+                    for (j = 0; j < tracks.length; j++) if (captionKey(tracks[j]) === req.id) want = tracks[j];
+                    if (!want) return 'missing';
+                } else if (req.type === 'translate') {
+                    var from = currentCaption();
+                    from = from ? (findCaption(tracks, from) || from) : null;
+                    if (!from) {
+                        // CC off: translate from the spoken language's track
+                        // (human-made over auto-generated), else any human one.
+                        var src = tracks.filter(isTranslatable);
+                        var spoken = currentAudioId().split('.')[0].split('-')[0];
+                        var sameLang = src.filter(function(c) { return String(c.languageCode).split('-')[0] === spoken; });
+                        from = sameLang.filter(function(c) { return c.kind !== 'asr'; })[0] || sameLang[0] ||
+                               src.filter(function(c) { return c.kind !== 'asr'; })[0] || src[0];
+                    }
+                    if (!from) return 'missing';
+                    want = {};
+                    for (var key in from) if (key !== 'translationLanguage') want[key] = from[key];
+                    want.translationLanguage = { languageCode: req.id };
+                }
+                setCaption(want);
+                settle(function() { return captionMatches(want); }, function() { setCaption(want); });
+                return captionMatches(want) ? 'ok' : 'pending';
+            }
+            if (video && req.type === 'audio' && video.audioTracks) {
+                for (var a = 0; a < video.audioTracks.length; a++) video.audioTracks[a].enabled = String(a) === req.id;
+                return 'ok';
+            }
+            if (video && req.type === 'captions' && video.textTracks) {
+                for (var c = 0; c < video.textTracks.length; c++) {
+                    var tt = video.textTracks[c];
+                    if (tt.kind === 'subtitles' || tt.kind === 'captions') tt.mode = String(c) === req.id ? 'showing' : 'disabled';
+                }
+                return 'ok';
+            }
+            return 'unsupported';
+        }
+
+        if (req.action === 'sync') {
+            if (window.__floatVideoPrefsApplied) return 'done';
+            if (!p) return 'retry';
+            // While an ad plays, the player exposes the ad's tracks — applying
+            // now would misfire. Report distinctly so the native side keeps
+            // waiting without burning the deadline.
+            if (inAd()) { window.__floatVideoSyncStable = 0; return 'ad'; }
+            var s = req.prefs || {};
+            if (s.rate > 0 && s.rate !== 1 && typeof p.setPlaybackRate === 'function') {
+                try { p.setPlaybackRate(s.rate); } catch (e) {}
+            }
+            if (!yt) return 'retry';
+            // Only act during real playback: while the player is still
+            // starting up it re-picks its own audio track and captions,
+            // silently reverting anything applied earlier.
+            var state = -1;
+            try { state = p.getPlayerState(); } catch (e) {}
+            if (state !== 1) return 'retry';
+            var dirty = false;
+            // Audio first: each audio track carries its own caption list.
+            if (s.audioId) {
+                var audioTarget = findAudio(s.audioId, true);
+                window.__floatVideoAudioSyncTries = window.__floatVideoAudioSyncTries || 0;
+                if (audioTarget && currentAudioId() !== audioInfo(audioTarget).id &&
+                    window.__floatVideoAudioSyncTries < 3) {
+                    window.__floatVideoAudioSyncTries++;
+                    try { p.setAudioTrack(audioTarget); } catch (e) {}
+                    window.__floatVideoSyncStable = 0;
+                    return 'retry'; // captions next tick, once the switch settles
+                }
+            }
+            if (s.captionTrack) {
+                if (!captionMatches(s.captionTrack)) {
+                    try { setCaption(s.captionTrack); } catch (e) {}
+                    dirty = true;
+                }
+            } else if (s.captionsOff && currentCaption()) {
+                try { p.setOption('captions', 'track', {}); } catch (e) {}
+                dirty = true;
+            }
+            // YouTube may also flip CC on by itself a few seconds into playback
+            // (sticky language, "recommended" initial state), so only call it
+            // done once the whole state has held for a few ticks.
+            window.__floatVideoSyncStable = dirty ? 0 : (window.__floatVideoSyncStable || 0) + 1;
+            if (window.__floatVideoSyncStable < 4) return 'retry';
+            window.__floatVideoPrefsApplied = true;
+            return 'applied';
+        }
+        return null;
+    })
+    """
+
+    private func runMediaTracksJS(_ request: [String: Any], completion: ((Any?) -> Void)? = nil) {
+        guard let data = try? JSONSerialization.data(withJSONObject: request) else { return }
+        let js = "\(Self.mediaTracksJS)(JSON.parse(atob('\(data.base64EncodedString())')))"
+        webView.evaluateJavaScript(js) { result, error in
+            if let error = error {
+                NSLog("[FloatVideo] Media tracks JS error: \(error)")
+            }
+            completion?(result)
+        }
+    }
+
+    @objc private func showTrackMenu(_ sender: NSButton) {
+        // Tracks are read fresh on every open: they change with the video,
+        // with ads, and (captions) with the selected audio track.
+        runMediaTracksJS(["action": "query"]) { [weak self] result in
+            guard let self = self else { return }
+            let menu = self.buildTrackMenu(result as? [String: Any] ?? [:])
+            self.popUpTrackMenu(menu, from: sender)
+        }
+    }
+
+    private func buildTrackMenu(_ info: [String: Any]) -> NSMenu {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+
+        let notice: String?
+        if info["loading"] as? Bool == true {
+            notice = "Player is still loading…"
+        } else if info["ad"] as? Bool == true {
+            notice = "Available after the ad"
+        } else if (info["source"] as? String ?? "none") == "none" {
+            notice = "No audio track or subtitle options for this video"
+        } else {
+            notice = nil
+        }
+        if let notice = notice {
+            let item = NSMenuItem(title: notice, action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+            return menu
+        }
+
+        let audio = (info["audio"] as? [[String: Any]] ?? []).map { track -> NSMenuItem in
+            var label = track["label"] as? String ?? ""
+            if track["autoDubbed"] as? Bool == true, label.range(of: "dub", options: .caseInsensitive) == nil {
+                label += " (auto-dubbed)"
+            }
+            return trackMenuItem(label, selected: track["selected"] as? Bool == true,
+                                 request: ["type": "audio", "id": track["id"] as? String ?? ""])
+        }
+        if audio.isEmpty {
+            let item = NSMenuItem(title: "Default", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            item.state = .on
+            addTrackSection(to: menu, title: "Audio Track", items: [item])
+        } else {
+            addTrackSection(to: menu, title: "Audio Track", items: audio)
+        }
+
+        menu.addItem(.separator())
+        let captionsOn = info["captionsOn"] as? Bool == true
+        var subtitles = [trackMenuItem("Off", selected: !captionsOn, request: ["type": "captions", "id": ""])]
+        subtitles += (info["captions"] as? [[String: Any]] ?? []).map { track in
+            trackMenuItem(track["label"] as? String ?? "", selected: track["selected"] as? Bool == true,
+                          request: ["type": "captions", "id": track["id"] as? String ?? ""])
+        }
+        addTrackSection(to: menu, title: "Subtitles/CC", items: subtitles)
+
+        let languages = info["translationLanguages"] as? [[String: Any]] ?? []
+        if !languages.isEmpty {
+            menu.addItem(autoTranslateMenuItem(languages: languages,
+                                               current: info["translation"] as? String ?? ""))
+        }
+        return menu
+    }
+
+    /// Adds a titled group of radio-style items. Long lists (heavily dubbed
+    /// videos carry 20+ audio tracks) collapse into a submenu so the menu
+    /// stays on screen.
+    private func addTrackSection(to menu: NSMenu, title: String, items: [NSMenuItem]) {
+        if items.count > 8 {
+            let current = items.first { $0.state == .on }?.title
+            let parent = NSMenuItem(title: current.map { "\(title): \($0)" } ?? title,
+                                    action: nil, keyEquivalent: "")
+            let submenu = NSMenu()
+            submenu.autoenablesItems = false
+            items.forEach { submenu.addItem($0) }
+            parent.submenu = submenu
+            menu.addItem(parent)
+            return
+        }
+        if #available(macOS 14.0, *) {
+            menu.addItem(.sectionHeader(title: title))
+        } else {
+            let header = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            header.isEnabled = false
+            menu.addItem(header)
+        }
+        items.forEach { menu.addItem($0) }
+    }
+
+    private func autoTranslateMenuItem(languages: [[String: Any]], current: String) -> NSMenuItem {
+        let entries = languages.compactMap { lang -> (code: String, label: String)? in
+            guard let code = lang["id"] as? String, !code.isEmpty else { return nil }
+            return (code, lang["label"] as? String ?? code)
+        }
+        let currentLabel = entries.first { $0.code == current }?.label
+        let parent = NSMenuItem(title: currentLabel.map { "Auto-translate: \($0)" } ?? "Auto-translate",
+                                action: nil, keyEquivalent: "")
+        parent.state = currentLabel == nil ? .off : .on
+
+        let submenu = NSMenu()
+        submenu.autoenablesItems = false
+        // The full list runs to 150+ languages; put the user's own first.
+        var preferred: [(code: String, label: String)] = []
+        for tag in Locale.preferredLanguages {
+            for entry in entries where (tag == entry.code || tag.hasPrefix(entry.code + "-"))
+                && !preferred.contains(where: { $0.code == entry.code }) {
+                preferred.append(entry)
+            }
+        }
+        for entry in preferred {
+            submenu.addItem(trackMenuItem(entry.label, selected: entry.code == current,
+                                          request: ["type": "translate", "id": entry.code]))
+        }
+        if !preferred.isEmpty { submenu.addItem(.separator()) }
+        for entry in entries {
+            submenu.addItem(trackMenuItem(entry.label, selected: entry.code == current,
+                                          request: ["type": "translate", "id": entry.code]))
+        }
+        parent.submenu = submenu
+        return parent
+    }
+
+    private func trackMenuItem(_ title: String, selected: Bool, request: [String: Any]) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: #selector(trackMenuItemSelected(_:)), keyEquivalent: "")
+        item.target = self
+        item.state = selected ? .on : .off
+        item.representedObject = request
+        return item
+    }
+
+    @objc private func trackMenuItemSelected(_ item: NSMenuItem) {
+        guard var request = item.representedObject as? [String: Any] else { return }
+        request["action"] = "select"
+        // The pick wins over the float-time sync from the Chrome tab, which may
+        // still be retrying (e.g. holding captions off).
+        prefsApplyDeadline = nil
+        runMediaTracksJS(request) { result in
+            let type = request["type"] as? String ?? "?"
+            let id = request["id"] as? String ?? ""
+            NSLog("[FloatVideo] Track menu: \(type)=\(id.isEmpty ? "off" : id) -> \(result as? String ?? "nil")")
+        }
+    }
+
+    private func popUpTrackMenu(_ menu: NSMenu, from button: NSButton) {
+        guard let bar = button.superview else { return }
+        // Menus draw at the pop-up-menu window level. If this panel sits above
+        // it (configureWindow asks for maximumWindow + 1) it would paint over
+        // its own menu, so drop just under the menu level while it is open.
+        let savedLevel = level
+        let menuLevel = NSWindow.Level.popUpMenu.rawValue
+        if savedLevel.rawValue >= menuLevel {
+            level = NSWindow.Level(rawValue: menuLevel - 1)
+        }
+        defer { level = savedLevel }
+        // Open upward, right-aligned to the button (like YouTube's settings
+        // panel); AppKit still shifts it to stay on screen.
+        let size = menu.size
+        let topLeft = NSPoint(x: button.frame.maxX - size.width, y: button.frame.maxY + size.height)
+        menu.popUp(positioning: nil, at: topLeft, in: bar)
     }
 
     // MARK: - Control Bar State Polling

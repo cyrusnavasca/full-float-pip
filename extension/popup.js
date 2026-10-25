@@ -119,8 +119,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 });
 
 // Captures YouTube player settings from the tab so the floating window can
-// mirror them: active caption track (incl. auto-translate target), playback
-// rate, and all yt-player-* localStorage (sticky captions/quality/volume).
+// mirror them: audio track (dubbed videos), active caption track (incl.
+// auto-translate target) or captions explicitly off, playback rate, and all
+// yt-player-* localStorage (sticky captions/quality/volume).
 // Runs in the page's MAIN world because the player API lives on the page's
 // #movie_player element, out of reach of the isolated content-script world.
 async function capturePlayerPrefs(tabId, site) {
@@ -130,7 +131,10 @@ async function capturePlayerPrefs(tabId, site) {
             target: { tabId },
             world: 'MAIN',
             func: () => {
-                const out = { localStorage: {}, captionTrack: null, playbackRate: 1 };
+                const out = {
+                    localStorage: {}, captionTrack: null, captionsOff: false,
+                    audioTrack: null, playbackRate: 1,
+                };
                 try {
                     for (let i = 0; i < localStorage.length; i++) {
                         const k = localStorage.key(i);
@@ -141,16 +145,37 @@ async function capturePlayerPrefs(tabId, site) {
                 } catch (e) {}
                 try {
                     const p = document.getElementById('movie_player');
-                    if (p && typeof p.getOption === 'function') {
+                    // During an ad the player reports the AD's tracks; capturing
+                    // then would mirror the wrong state (e.g. "captions off").
+                    const inAd = !!(p && p.classList &&
+                        (p.classList.contains('ad-showing') || p.classList.contains('ad-interrupting')));
+                    if (p && !inAd && typeof p.getOption === 'function') {
                         const t = p.getOption('captions', 'track');
                         if (t && t.languageCode) {
                             out.captionTrack = { languageCode: t.languageCode };
                             if (t.kind) out.captionTrack.kind = t.kind;
+                            if (t.vss_id) out.captionTrack.vssId = t.vss_id;
                             if (t.translationLanguage && t.translationLanguage.languageCode) {
                                 out.captionTrack.translationLanguage = {
                                     languageCode: t.translationLanguage.languageCode,
                                 };
                             }
+                        } else {
+                            // Explicit "off": otherwise the floating window keeps
+                            // whatever captions YouTube auto-enables there.
+                            out.captionsOff = true;
+                        }
+                    }
+                    if (p && !inAd && typeof p.getAudioTrack === 'function' &&
+                        typeof p.getAvailableAudioTracks === 'function') {
+                        const cur = p.getAudioTrack();
+                        const info = cur && typeof cur.getLanguageInfo === 'function'
+                            ? cur.getLanguageInfo() : null;
+                        // Only dubbed (multi-track) videos have a choice to mirror;
+                        // the float window's different language would otherwise
+                        // make YouTube pick another (often auto-dubbed) track.
+                        if ((p.getAvailableAudioTracks() || []).length > 1 && info && info.id) {
+                            out.audioTrack = { id: info.id };
                         }
                     }
                     if (p && typeof p.getPlaybackRate === 'function') {

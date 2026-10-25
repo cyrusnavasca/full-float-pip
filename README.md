@@ -46,6 +46,7 @@ No window switching. No split screen. No leaving fullscreen. Just code and video
 - **Cross-Space Visibility** — Video window visible across all macOS Desktops / Spaces
 - **PiP-Style UI** — Clean, borderless video window; controls appear on hover
 - **YouTube-Style Control Bar** — Play/pause, skip 10s, volume slider, progress bar with seek, time display
+- **Audio Track & Subtitles** — Pick the audio language (incl. dubbed / auto-dubbed tracks), subtitles and auto-translate from the ⚙ button; the Chrome tab's current choice is carried over when you float
 - **Auto Video Detection** — Badge shows video count; auto-detects SPA navigation (YouTube, Bilibili)
 - **Aspect Ratio Lock** — Window maintains video aspect ratio during resize
 - **Position Memory** — Remembers window position and size between sessions
@@ -118,6 +119,7 @@ Then load the extension in Chrome:
 - **Skip 10s** — Jump forward 10 seconds
 - **Volume** — Mute toggle + slider
 - **Time display** — Current position / total duration
+- **⚙ Audio & subtitles** — Choose the audio track, subtitles/CC (or Off) and an auto-translate language
 - **ESC** — Close the floating window
 - **Resize** — Drag any edge or corner (aspect ratio locked)
 
@@ -161,6 +163,7 @@ Chrome's built-in Picture-in-Picture uses the browser's own window management. O
 - **DRM Content** — Netflix, Disney+, and other Widevine DRM-protected platforms cannot play in the floating window
 - **Blob URLs** — Some sites use blob URLs for video streaming; these fall back to full-page load with JS injection
 - **Cookie Sharing** — The floating window doesn't share login state with Chrome; some sites may require re-login
+- **Audio/Subtitle Menu** — Works for YouTube and for sites using standard HTML5 audio/text tracks; not for embedded players (Bilibili, Twitch, Youku, YouTube embed fallback)
 - **macOS Only** — Requires macOS 12+ and a native Swift companion app; not available on Windows/Linux
 
 ## Uninstall
