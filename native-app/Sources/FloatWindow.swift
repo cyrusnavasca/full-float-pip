@@ -20,8 +20,29 @@ private class LoadingOverlayView: NSView {
 // MARK: - DraggableTitleBar — Title bar that supports drag-to-move window
 
 private class DraggableTitleBar: NSView {
+    // The whole bar drags (title text included); only its buttons keep clicks.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let hit = super.hitTest(point) else { return nil }
+        return hit is NSButton ? hit : self
+    }
+
     override func mouseDown(with event: NSEvent) {
+        NSCursor.closedHand.set()
         window?.performDrag(with: event)
+    }
+}
+
+// MARK: - ResizeBorderView — Transparent strip over the web view's edges
+
+/// Sits above the WKWebView so hit-testing at the resize border lands here
+/// instead of the page. Otherwise WebKit re-applies the page's own cursor right
+/// after ours. Clicks are still handled by FloatWindow.sendEvent.
+private class ResizeBorderView: NSView {
+    var isResizePoint: ((NSPoint) -> Bool)?
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let windowPoint = superview?.convert(point, to: nil) ?? point
+        return isResizePoint?(windowPoint) == true ? self : nil
     }
 }
 
@@ -29,12 +50,26 @@ private class DraggableTitleBar: NSView {
 
 private class ProgressClickView: NSView {
     var onSeek: ((Double) -> Void)?
+    /// Hovered position as a fraction of the bar, nil when the mouse leaves.
+    var onHover: ((Double?) -> Void)?
 
-    override func mouseDown(with event: NSEvent) {
-        let loc = convert(event.locationInWindow, from: nil)
-        let percent = max(0, min(1, Double(loc.x / bounds.width)))
-        onSeek?(percent)
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: .zero,
+                                       options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                       owner: self, userInfo: nil))
     }
+
+    private func percent(_ event: NSEvent) -> Double {
+        let loc = convert(event.locationInWindow, from: nil)
+        return max(0, min(1, Double(loc.x / bounds.width)))
+    }
+
+    override func mouseDown(with event: NSEvent) { onSeek?(percent(event)) }
+    override func mouseMoved(with event: NSEvent) { onHover?(percent(event)) }
+    override func mouseEntered(with event: NSEvent) { onHover?(percent(event)) }
+    override func mouseExited(with event: NSEvent) { onHover?(nil) }
 }
 
 // MARK: - FloatWindow — Always-on-top floating video window
@@ -52,6 +87,11 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
     private var timeLabel: NSTextField!
     private var progressBg: NSView!
     private var progressPlayed: NSView!
+    private var progressHit: NSView!
+    private var progressHover: NSView!
+    private var hoverTimeLabel: NSTextField!
+    private var lastDuration: Double = 0
+    private var showingCustomCursor = false
     private var updateTimer: Timer?
     private var videoTitle: String
     private var isPlaying = true
@@ -61,6 +101,8 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
     // Video loading parameters (used by WKNavigationDelegate callbacks)
     private var currentSite: String = "generic"
     private var currentVideoTime: Double = 0
+    /// Last observed position in the main content (never an ad), reported back to Chrome on close.
+    private(set) var lastContentTime: Double = 0
     private var hasInjectedJS = false
     private var hasInjectedAdSkip = false
     private var lastAdSkipCount = 0
@@ -103,6 +145,11 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
     private var isResizing = false
     private var resizeEdge: ResizeEdge = .none
     private let resizeBorderWidth: CGFloat = 12
+
+    /// Cursor the window shows at a point; nil leaves it to the web page.
+    enum CursorKind: String {
+        case resizeNWSE, resizeNESW, resizeLeftRight, resizeUpDown, openHand, pointingHand
+    }
 
     enum ResizeEdge {
         case none
@@ -306,6 +353,11 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
         progressBg.autoresizingMask = [.width]
         controlBarView.addSubview(progressBg)
 
+        progressHover = NSView(frame: NSRect(x: 0, y: barH - 4, width: 0, height: 4))
+        progressHover.wantsLayer = true
+        progressHover.layer?.backgroundColor = NSColor(white: 1.0, alpha: 0.35).cgColor
+        controlBarView.addSubview(progressHover)
+
         progressPlayed = NSView(frame: NSRect(x: 0, y: barH - 4, width: 0, height: 4))
         progressPlayed.wantsLayer = true
         progressPlayed.layer?.backgroundColor = NSColor(red: 1.0, green: 0.0, blue: 0.0, alpha: 1.0).cgColor
@@ -315,7 +367,9 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
         let progressHit = ProgressClickView(frame: NSRect(x: 0, y: barH - 12, width: width, height: 12))
         progressHit.autoresizingMask = [.width]
         progressHit.onSeek = { [weak self] percent in self?.seekTo(percent: percent) }
+        progressHit.onHover = { [weak self] percent in self?.showProgressHover(at: percent) }
         controlBarView.addSubview(progressHit)
+        self.progressHit = progressHit
 
         // -- Control button row (y=0 to barH-4)
         var x: CGFloat = 8
@@ -374,6 +428,18 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
 
         container.addSubview(controlBarView)
 
+        // Timestamp shown above the progress bar while hovering it
+        let hoverLabel = NSTextField(labelWithString: "")
+        hoverLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        hoverLabel.textColor = .white
+        hoverLabel.alignment = .center
+        hoverLabel.wantsLayer = true
+        hoverLabel.layer?.backgroundColor = NSColor(white: 0.1, alpha: 0.85).cgColor
+        hoverLabel.layer?.cornerRadius = 4
+        hoverLabel.isHidden = true
+        container.addSubview(hoverLabel)
+        self.hoverTimeLabel = hoverLabel
+
         // Hide title bar by default (PiP-style: shown on hover)
         titleBarView.alphaValue = 0
 
@@ -389,6 +455,11 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
         resizeIndicator.font = NSFont.systemFont(ofSize: 12)
         resizeIndicator.autoresizingMask = [.minXMargin, .maxYMargin]
         container.addSubview(resizeIndicator)
+
+        let border = ResizeBorderView(frame: container.bounds)
+        border.autoresizingMask = [.width, .height]
+        border.isResizePoint = { [weak self] point in self?.resizeEdgeForClick(at: point) != ResizeEdge.none }
+        container.addSubview(border)
 
         self.contentView = container
 
@@ -442,6 +513,20 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
         self.setFrameOrigin(NSPoint(x: x, y: y))
     }
 
+    /// Recovery for a PiP dragged out of reach: put it at the bottom-left of the
+    /// screen the mouse is on (where the user just clicked the extension).
+    /// Returns that screen's visible frame.
+    @discardableResult
+    func moveToCorner() -> NSRect? {
+        let mouse = NSEvent.mouseLocation
+        guard let screen = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) })
+                ?? NSScreen.main else { return nil }
+        let visible = screen.visibleFrame
+        setFrameOrigin(NSPoint(x: visible.minX + 24, y: visible.minY + 24))
+        saveWindowFrame()
+        return visible
+    }
+
     private func saveWindowFrame() {
         let frame = self.frame
         let dict: [String: CGFloat] = [
@@ -461,6 +546,7 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
         // Save parameters for NavigationDelegate use
         self.currentSite = site
         self.currentVideoTime = currentTime
+        self.lastContentTime = currentTime
         self.currentPageURL = url
         self.httpServerPortProvider = httpServerPortProvider
         self.playerPrefs = playerPrefs
@@ -468,6 +554,7 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
         self.loadingStrategy = .fullPageInject
         resetYouTubeFallbackState()
         installPlayerPrefsSeedScript()
+        installAdPruneScript()
 
         if site == "youtube" {
             // One-line capture summary so caption/audio problems are attributable
@@ -505,7 +592,7 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
         if site == "youtube" {
             refreshYouTubeEmbedFallbackURLIfNeeded()
 
-            if !url.isEmpty, let pageURL = URL(string: url) {
+            if !url.isEmpty, let pageURL = youtubeURL(url, startingAt: currentTime) {
                 let loadPage = { [weak self] in
                     self?.loadingStrategy = .fullPageInject
                     self?.webView.load(URLRequest(url: pageURL))
@@ -579,6 +666,16 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
             NSLog("[FloatVideo] All cookies injected")
             completion()
         }
+    }
+
+    /// YouTube applies the URL's `t` after any JS seek we make, so the tab's
+    /// position has to travel in the URL itself.
+    private func youtubeURL(_ url: String, startingAt seconds: Double) -> URL? {
+        guard var components = URLComponents(string: url) else { return nil }
+        var items = (components.queryItems ?? []).filter { $0.name != "t" }
+        if seconds >= 1 { items.append(URLQueryItem(name: "t", value: "\(Int(seconds))s")) }
+        components.queryItems = items
+        return components.url
     }
 
     private func extractYouTubeVideoId(from url: String) -> String? {
@@ -689,6 +786,40 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
         controller.addUserScript(WKUserScript(source: source,
                                               injectionTime: .atDocumentStart,
                                               forMainFrameOnly: true))
+    }
+
+    /// Chrome's ad blocker doesn't reach this WKWebView, and every float is a fresh
+    /// page load, so YouTube serves a pre-roll. Strip the ad slots from the player
+    /// response before the player reads it (same approach as uBlock Origin's
+    /// json-prune): the inline `ytInitialPlayerResponse` and later JSON responses.
+    private func installAdPruneScript() {
+        guard currentSite == "youtube" else { return }
+        let source = """
+        (function() {
+            var KEYS = ['adPlacements', 'playerAds', 'adSlots', 'adBreakHeartbeatParams'];
+            function prune(o) {
+                if (!o || typeof o !== 'object') return o;
+                var targets = [o, o.playerResponse];
+                for (var i = 0; i < targets.length; i++) {
+                    var t = targets[i];
+                    if (t && typeof t === 'object') KEYS.forEach(function(k) { delete t[k]; });
+                }
+                return o;
+            }
+            var initial;
+            Object.defineProperty(window, 'ytInitialPlayerResponse', {
+                configurable: true,
+                get: function() { return initial; },
+                set: function(v) { initial = prune(v); }
+            });
+            var parse = JSON.parse;
+            JSON.parse = function() { return prune(parse.apply(this, arguments)); };
+            var json = Response.prototype.json;
+            Response.prototype.json = function() { return json.apply(this, arguments).then(prune); };
+        })();
+        """
+        webView.configuration.userContentController.addUserScript(
+            WKUserScript(source: source, injectionTime: .atDocumentStart, forMainFrameOnly: true))
     }
 
     /// Re-applies the exact per-video player state captured from the Chrome tab
@@ -1175,6 +1306,19 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
                         }
                     }, 120);
                 });
+                // YouTube builds the player in a staging div and only later moves
+                // it into ytd-app, which the first pass hid as a non-ancestor —
+                // leaving a blank window until a resize. Re-lay out on any move.
+                setInterval(() => {
+                    const v = window.__floatVideoMainVideo;
+                    if (!v || !document.contains(v)) return;
+                    for (let el = v.parentElement; el; el = el.parentElement) {
+                        if (!el.classList.contains('__floatvideo-ancestor')) {
+                            window.__floatVideoApplyLayout();
+                            return;
+                        }
+                    }
+                }, 500);
             }
 
             return applyLayout();
@@ -1470,6 +1614,7 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
         // Start cursor-position polling for reliable auto-hide (event-based
         // approaches fail on non-activating panels and under WKWebView).
         startCursorPolling()
+        startProbeIfDebugging()
         // Safety: hide loading overlay after 8s regardless
         DispatchQueue.main.asyncAfter(deadline: .now() + 8.0) { [weak self] in
             self?.hideLoadingOverlay()
@@ -1839,7 +1984,12 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
             });
         }
 
-        if (req.action === 'query') {
+        function currentRate() {
+            try { if (p && typeof p.getPlaybackRate === 'function') return p.getPlaybackRate(); } catch (e) {}
+            return video ? video.playbackRate : 1;
+        }
+
+        function queryTracks() {
             if (p) {
                 if (!yt) return { source: 'youtube', loading: true };
                 if (inAd()) return { source: 'youtube', ad: true };
@@ -1880,6 +2030,20 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
                 return out;
             }
             return { source: 'none' };
+        }
+
+        if (req.action === 'query') {
+            var info = queryTracks();
+            info.rate = currentRate();
+            return info;
+        }
+
+        if (req.action === 'select' && req.type === 'speed') {
+            var rate = Number(req.id);
+            if (p && typeof p.setPlaybackRate === 'function') p.setPlaybackRate(rate);
+            else if (video) video.playbackRate = rate;
+            else return 'unsupported';
+            return 'ok';
         }
 
         if (req.action === 'select') {
@@ -2010,6 +2174,15 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
     private func buildTrackMenu(_ info: [String: Any]) -> NSMenu {
         let menu = NSMenu()
         menu.autoenablesItems = false
+
+        let rate = (info["rate"] as? NSNumber)?.doubleValue ?? 1
+        let speeds = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map { speed in
+            trackMenuItem(speed == 1 ? "Normal" : "\(speed.formatted())×",
+                          selected: abs(speed - rate) < 0.01,
+                          request: ["type": "speed", "id": "\(speed)"])
+        }
+        addTrackSection(to: menu, title: "Playback Speed", items: speeds)
+        menu.addItem(.separator())
 
         let notice: String?
         if info["loading"] as? Bool == true {
@@ -2172,9 +2345,56 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
         }
     }
 
+    // Test hook: with FV_DEBUG set, log a machine-readable page snapshot every 2s
+    // for tests/e2e.py (video size, position, ad state, ad slots in the response).
+    private var probeTimer: Timer?
+    private func startProbeIfDebugging() {
+        guard ProcessInfo.processInfo.environment["FV_DEBUG"] != nil else { return }
+        // UI snapshot once the video is playing: cursor per window region, and the
+        // progress-bar hover label at 50%.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+            guard let self = self else { return }
+            let w = self.frame.width, h = self.frame.height
+            let points: [String: NSPoint] = [
+                "bottomLeft": NSPoint(x: 2, y: 2), "bottomRight": NSPoint(x: w - 2, y: 2),
+                "topLeft": NSPoint(x: 2, y: h - 2), "topRight": NSPoint(x: w - 2, y: h - 2),
+                "right": NSPoint(x: w - 2, y: h / 2), "titleBar": NSPoint(x: w / 2, y: h - 20),
+                "progressBar": NSPoint(x: w / 2, y: 38), "center": NSPoint(x: w / 2, y: h / 2),
+            ]
+            let cursors = points.mapValues { self.cursorKind(at: $0)?.rawValue ?? "page" }
+            self.showProgressHover(at: 0.5)
+            let snapshot: [String: Any] = ["cursors": cursors,
+                                           "hoverLabel": self.hoverTimeLabel.stringValue,
+                                           "expectedLabel": self.formatTime(self.lastDuration * 0.5)]
+            self.showProgressHover(at: nil)
+            if let data = try? JSONSerialization.data(withJSONObject: snapshot),
+               let json = String(data: data, encoding: .utf8) {
+                NSLog("[FloatVideo] UIPROBE \(json)")
+            }
+        }
+        probeTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            let js = """
+            (function(){ try {
+              var v = window.__floatVideoMainVideo || document.querySelector('video');
+              var mp = document.querySelector('#movie_player');
+              var pr = (mp && mp.getPlayerResponse && mp.getPlayerResponse()) || window.ytInitialPlayerResponse || {};
+              var r = v ? v.getBoundingClientRect() : {width: 0, height: 0};
+              return JSON.stringify({w: Math.round(r.width), h: Math.round(r.height),
+                ct: v ? v.currentTime : -1,
+                ad: !!(mp && mp.classList.contains('ad-showing')),
+                adSlots: (pr.adPlacements || []).length + (pr.playerAds || []).length + (pr.adSlots || []).length});
+            } catch (e) { return null; } })()
+            """
+            self?.webView.evaluateJavaScript(js) { r, _ in
+                if let r = r as? String { NSLog("[FloatVideo] PROBE \(r)") }
+            }
+        }
+    }
+
     private func stopUpdateTimer() {
         updateTimer?.invalidate()
         updateTimer = nil
+        probeTimer?.invalidate()
     }
 
     private func pollVideoState() {
@@ -2207,6 +2427,10 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
             let vol = dict["vol"] as? Double ?? 1
             let muted = dict["muted"] as? Bool ?? false
             let paused = dict["paused"] as? Bool ?? true
+            if (dict["ads"] as? Bool) != true {
+                if ct > 0 { self.lastContentTime = ct }
+                if dur.isFinite, dur > 0 { self.lastDuration = dur }
+            }
 
             // Diagnostics: log whenever the in-page ad-skip guard has clicked Skip
             // since the last poll (the guard runs in-page, so surface it natively).
@@ -2315,14 +2539,76 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
         return .none
     }
 
-    private func cursorForEdge(_ edge: ResizeEdge) -> NSCursor {
-        switch edge {
+    /// The edge a click at this point resizes. Corners always resize; the plain
+    /// top edge yields to the title bar's drag while the title bar is showing.
+    private func resizeEdgeForClick(at point: NSPoint) -> ResizeEdge {
+        let edge = detectResizeEdge(at: point)
+        if edge == .top, titleBarView.alphaValue > 0, titleBarView.frame.contains(point) {
+            return .none
+        }
+        return edge
+    }
+
+    func cursorKind(at point: NSPoint) -> CursorKind? {
+        switch resizeEdgeForClick(at: point) {
+        case .topLeft, .bottomRight: return .resizeNWSE
+        case .topRight, .bottomLeft: return .resizeNESW
         case .left, .right: return .resizeLeftRight
         case .top, .bottom: return .resizeUpDown
-        case .topLeft, .bottomRight: return .crosshair
-        case .topRight, .bottomLeft: return .crosshair
-        case .none: return .arrow
+        case .none: break
         }
+        guard let hit = contentView?.hitTest(point) else { return nil }
+        if hit === titleBarView { return .openHand }
+        if hit === progressHit { return .pointingHand }
+        return nil
+    }
+
+    private func cursor(for kind: CursorKind) -> NSCursor {
+        if #available(macOS 15.0, *) {
+            switch kind {
+            case .resizeNWSE: return .frameResize(position: .topLeft, directions: .all)
+            case .resizeNESW: return .frameResize(position: .topRight, directions: .all)
+            default: break
+            }
+        }
+        switch kind {
+        case .resizeNWSE, .resizeNESW: return .crosshair // no public diagonal cursor before macOS 15
+        case .resizeLeftRight: return .resizeLeftRight
+        case .resizeUpDown: return .resizeUpDown
+        case .openHand: return .openHand
+        case .pointingHand: return .pointingHand
+        }
+    }
+
+    private func updateCursor(at point: NSPoint) {
+        if let kind = cursorKind(at: point) {
+            cursor(for: kind).set()
+            showingCustomCursor = true
+        } else if showingCustomCursor {
+            // Hand back to the page; WebKit sets its own cursor from here.
+            NSCursor.arrow.set()
+            showingCustomCursor = false
+        }
+    }
+
+    /// Shows the hovered timestamp above the progress bar (nil hides it).
+    func showProgressHover(at percent: Double?) {
+        guard let percent = percent, lastDuration > 0 else {
+            hoverTimeLabel.isHidden = true
+            progressHover.frame.size.width = 0
+            return
+        }
+        progressHover.frame.size.width = progressBg.frame.width * CGFloat(percent)
+        hoverTimeLabel.stringValue = formatTime(lastDuration * percent)
+        hoverTimeLabel.sizeToFit()
+        var frame = hoverTimeLabel.frame
+        frame.size.width += 10
+        frame.size.height += 4
+        let barTop = controlBarView.frame.maxY
+        let x = progressBg.frame.width * CGFloat(percent) - frame.width / 2
+        frame.origin = NSPoint(x: max(4, min(x, controlBarView.frame.width - frame.width - 4)), y: barTop + 4)
+        hoverTimeLabel.frame = frame
+        hoverTimeLabel.isHidden = false
     }
 
     // MARK: - Event Interception (intercept resize events before WKWebView)
@@ -2333,14 +2619,8 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
             // Synthetic trusted clicks (ad skip) must reach the web view even
             // when they land inside the resize border.
             if isPostingSyntheticClick { break }
-            let location = event.locationInWindow
-            let edge = detectResizeEdge(at: location)
+            let edge = resizeEdgeForClick(at: event.locationInWindow)
             if edge != .none {
-                // When title bar is visible, drag takes priority over top-edge resize
-                if titleBarView.alphaValue > 0,
-                   titleBarView.frame.contains(location) {
-                    break // Let DraggableTitleBar handle the drag
-                }
                 isResizing = true
                 resizeEdge = edge
                 initialMouseLocation = NSEvent.mouseLocation
@@ -2366,10 +2646,8 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
     // MARK: - Mouse Handling
 
     override func mouseMoved(with event: NSEvent) {
-        // Show/hide driven by cursor polling; only update resize cursor here.
-        let location = event.locationInWindow
-        let edge = detectResizeEdge(at: location)
-        cursorForEdge(edge).set()
+        // Show/hide driven by cursor polling; only update the cursor here.
+        if !isResizing { updateCursor(at: event.locationInWindow) }
         super.mouseMoved(with: event)
     }
 
@@ -2437,13 +2715,15 @@ class FloatWindow: NSPanel, WKNavigationDelegate {
         }
         isResizing = false
         resizeEdge = .none
-        NSCursor.arrow.set()
+        updateCursor(at: event.locationInWindow)
         super.mouseUp(with: event)
     }
 
     override func mouseExited(with event: NSEvent) {
         if !isResizing {
             NSCursor.arrow.set()
+            showingCustomCursor = false
+            showProgressHover(at: nil)
         }
         super.mouseExited(with: event)
     }

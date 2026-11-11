@@ -74,10 +74,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             ])
 
         case "close":
+            let currentTime = floatWindow?.lastContentTime
             closeFloatWindow()
+            var reply: [String: Any] = ["type": "status", "status": "closed"]
+            reply["currentTime"] = currentTime
+            messageHandler?.sendMessage(reply)
+
+        case "moveToCorner":
+            guard let window = floatWindow, let screen = window.moveToCorner() else { break }
             messageHandler?.sendMessage([
                 "type": "status",
-                "status": "closed"
+                "status": "moved",
+                "x": window.frame.minX, "y": window.frame.minY,
+                "screenX": screen.minX, "screenY": screen.minY
             ])
 
         case "ping":
@@ -118,10 +127,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         floatWindow?.onClose = { [weak self] in
+            let currentTime = self?.floatWindow?.lastContentTime ?? 0
             self?.floatWindow = nil
             self?.messageHandler?.sendMessage([
                 "type": "status",
-                "status": "closed"
+                "status": "closed",
+                "currentTime": currentTime
             ])
         }
 

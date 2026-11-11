@@ -202,6 +202,47 @@ body {
   opacity: 1;
 }
 
+/* Stop floating: same button, danger color */
+.float-btn.stop {
+  background: var(--danger);
+  cursor: pointer;
+  transition: background 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.float-btn.stop:hover {
+  background: #ff6961;
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(255, 69, 58, 0.45);
+}
+
+.float-btn.stop:active {
+  transform: translateY(0);
+  box-shadow: none;
+}
+
+/* Move PiP to corner (only shown while something floats) */
+.corner-btn {
+  width: 100%;
+  margin-bottom: 10px;
+  padding: 8px 14px;
+  background: var(--bg-card);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.corner-btn:hover {
+  background: var(--bg-card-hover);
+}
+
+.corner-btn[hidden] {
+  display: none;
+}
+
 /* Footer */
 .footer {
   margin-top: 12px;

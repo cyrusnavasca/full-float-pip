@@ -8,6 +8,8 @@ class FloatVideoManager {
         this.tabVideos = new Map(); // tabId -> videoInfo[]
         this.isConnecting = false;
         this.floatingInProgress = false;
+        this.sourceTabId = null; // tab the PiP was opened from, synced on close
+        this.floating = null;    // { tabId, pageUrl } while a PiP is open, for the popup
     }
 
     // Establish persistent connection with Native App
@@ -27,6 +29,7 @@ class FloatVideoManager {
                 const err = chrome.runtime.lastError;
                 console.warn('[FloatVideo] Native port disconnected:', err?.message || 'unknown');
                 this.nativePort = null;
+                this.floating = null;
                 this.isConnecting = false;
             });
 
@@ -40,12 +43,13 @@ class FloatVideoManager {
     }
 
     // Send float video command to Native App
-    async floatVideo(videoInfo, playerPrefs) {
+    async floatVideo(videoInfo, playerPrefs, tabId) {
         // Prevent duplicate requests from rapid double-clicks
         if (this.floatingInProgress) {
             return { success: false, error: 'Already opening a video' };
         }
         this.floatingInProgress = true;
+        this.sourceTabId = tabId ?? null;
 
         try {
             return await this._doFloatVideo(videoInfo, playerPrefs);
@@ -125,6 +129,7 @@ class FloatVideoManager {
 
         try {
             this.nativePort.postMessage(message);
+            this.floating = { tabId: this.sourceTabId, pageUrl: videoInfo.pageUrl };
             return { success: true };
         } catch (e) {
             console.error('[FloatVideo] Send message failed:', e);
@@ -143,10 +148,39 @@ class FloatVideoManager {
         }
     }
 
+    moveFloatToCorner() {
+        if (!this.nativePort) return { success: false, error: 'Nothing is floating' };
+        this.nativePort.postMessage({ action: 'moveToCorner' });
+        return { success: true };
+    }
+
     _handleNativeMessage(msg) {
         if (msg.type === 'error') {
             console.error('[FloatVideo] Native error:', msg.error);
         }
+        if (msg.status === 'closed') this.floating = null;
+        if (msg.status === 'closed' && msg.currentTime > 0 && this.sourceTabId != null) {
+            this._seekSourceTab(msg.currentTime);
+        }
+    }
+
+    // Move the tab's player to where the PiP left off, so YouTube (logged in
+    // in Chrome) records the progress and the tab resumes from there.
+    _seekSourceTab(seconds) {
+        chrome.scripting.executeScript({
+            target: { tabId: this.sourceTabId },
+            world: 'MAIN',
+            args: [seconds],
+            func: (t) => {
+                const player = document.getElementById('movie_player');
+                if (player && typeof player.seekTo === 'function') {
+                    player.seekTo(t, true);
+                } else {
+                    const video = document.querySelector('video');
+                    if (video) video.currentTime = t;
+                }
+            },
+        }).catch((e) => console.warn('[FloatVideo] Sync back to tab failed:', e));
     }
 }
 
@@ -181,7 +215,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
         case 'FLOAT_VIDEO_REQUEST': {
             (async () => {
-                const result = await manager.floatVideo(message.videoInfo, message.playerPrefs || null);
+                const result = await manager.floatVideo(message.videoInfo, message.playerPrefs || null, message.tabId);
                 sendResponse(result);
             })();
             break;
@@ -190,6 +224,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case 'GET_TAB_VIDEOS': {
             const videos = manager.tabVideos.get(message.tabId) || [];
             sendResponse({ videos });
+            break;
+        }
+
+        case 'GET_FLOAT_STATE': {
+            sendResponse({ floating: manager.floating });
+            break;
+        }
+
+        case 'MOVE_FLOAT_TO_CORNER': {
+            sendResponse(manager.moveFloatToCorner());
             break;
         }
 

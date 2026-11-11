@@ -5,6 +5,31 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Get the current active tab
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+
+    // What's floating right now (any tab), so reopening the popup shows Stop
+    let floating = (await chrome.runtime.sendMessage({ type: 'GET_FLOAT_STATE' }))?.floating || null;
+    const cornerBtn = document.getElementById('corner-btn');
+    cornerBtn.addEventListener('click', async () => {
+        const res = await chrome.runtime.sendMessage({ type: 'MOVE_FLOAT_TO_CORNER' });
+        if (!res?.success) { floating = null; refresh(); }
+    });
+    let shown = [];
+
+    // Float / Stop per card, and the corner button, all follow `floating`
+    function refresh() {
+        cornerBtn.hidden = !floating;
+        document.querySelectorAll('.float-btn').forEach((btn) => {
+            const video = shown[parseInt(btn.dataset.index)];
+            const isFloating = !!floating && floating.tabId === tab?.id && floating.pageUrl === video.pageUrl;
+            btn.disabled = false;
+            btn.title = '';
+            btn.classList.toggle('stop', isFloating);
+            btn.textContent = isFloating ? '⏹ Stop floating' : '📌 Float';
+        });
+    }
+
+    refresh();
+
     if (!tab || !tab.id) {
         videoList.innerHTML = '<div class="empty">⚠️ Cannot access current tab</div>';
         return;
@@ -49,6 +74,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
 
         videoList.innerHTML = '';
+        shown = videos;
         videos.forEach((video, index) => {
             const card = document.createElement('div');
             card.className = 'video-card';
@@ -72,6 +98,13 @@ document.addEventListener('DOMContentLoaded', async () => {
                 const index = parseInt(button.dataset.index);
                 const video = videos[index];
 
+                if (button.classList.contains('stop')) {
+                    await chrome.runtime.sendMessage({ type: 'CLOSE_FLOAT' });
+                    floating = null;
+                    refresh();
+                    return;
+                }
+
                 // Disable button to prevent duplicate clicks
                 button.disabled = true;
                 button.textContent = '⏳ Connecting...';
@@ -92,11 +125,13 @@ document.addEventListener('DOMContentLoaded', async () => {
                     const result = await chrome.runtime.sendMessage({
                         type: 'FLOAT_VIDEO_REQUEST',
                         videoInfo: video,
+                        tabId: tab.id,
                         playerPrefs,
                     });
 
                     if (result?.success) {
-                        button.textContent = '✅ Floating';
+                        floating = { tabId: tab.id, pageUrl: video.pageUrl };
+                        refresh();
                     } else {
                         button.textContent = '❌ Failed';
                         button.title = result?.error || 'Unknown error';
@@ -115,6 +150,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 }
             });
         });
+        refresh();
     }
 });
 
