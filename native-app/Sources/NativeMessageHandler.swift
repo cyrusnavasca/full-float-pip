@@ -45,7 +45,8 @@ class NativeMessageHandler {
         case "status":
             let status = message["status"] as? String ?? "unknown"
             let title = truncated(message["title"] as? String ?? "")
-            return title.isEmpty ? "type=status status=\(status)" : "type=status status=\(status) title=\(title)"
+            let time = message["currentTime"].map { " time=\($0)" } ?? ""
+            return title.isEmpty ? "type=status status=\(status)\(time)" : "type=status status=\(status)\(time) title=\(title)"
         case "error":
             let error = truncated(message["error"] as? String ?? "")
             return "type=error error=\(error)"
